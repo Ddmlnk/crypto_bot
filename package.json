@@ -1,0 +1,27 @@
+{
+  "name": "crypto_bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ddmlnk/crypto_bot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Ddmlnk/crypto_bot/issues"
+  },
+  "homepage": "https://github.com/Ddmlnk/crypto_bot#readme",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "node-binance-api": "^1.0.32",
+    "node-cron": "^4.5.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "technicalindicators": "^3.1.0"
+  }
+}
