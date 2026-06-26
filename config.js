@@ -5,33 +5,35 @@
 // ============================================
 
 module.exports = {
-  // Монети для аналізу
-  symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-
-  // Таймфрейм для аналізу
-  // Варіанти: 15m, 1h, 4h, 1d
+  // Розширений список — 10 монет
+  symbols: [
+    // Топ-капа
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    // L1/L2 альти
+    "AVAXUSDT",
+    "LINKUSDT",
+    "ADAUSDT",
+    // Мемкоїни (для порівняння)
+    "DOGEUSDT",
+    "XRPUSDT",
+    "TRXUSDT",
+  ],
+  // ...решта config як є
   timeframe: "1h",
-
-  // Скільки свічок тягнути з Binance
-  // Треба мінімум 200 для EMA 200
   candlesLimit: 250,
-
-  // Параметри індикаторів
   indicators: {
     emaFast: 50,
     emaSlow: 200,
     rsiPeriod: 14,
   },
-
-  // Параметри ризик-менеджменту
-  // (поки що не використовуємо, але зберігаємо)
   risk: {
-    deposit: 100, // твій депозит
-    margin: 30, // маржа на угоду
-    leverage: 3, // плече
-    maxRiskUsd: 3, // максимальний ризик на угоду
+    deposit: 100,
+    margin: 30,
+    leverage: 3,
+    maxRiskUsd: 3,
   },
-
-  // Як часто перевіряти ринок (хв)
   checkIntervalMinutes: 15,
 };

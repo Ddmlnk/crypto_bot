@@ -1,20 +1,15 @@
 // ============================================
-// Тригери — правила входу в угоди
-// Тут визначаємо коли бот шле сигнал
+// PRICE ACTION ТРИГЕРИ
+// Без індикаторів, тільки структура ринку
 // ============================================
 
 const config = require("./config");
+const pa = require("./price_action");
 
-/**
- * Розрахунок розміру позиції та ризику
- * @param {number} entry - ціна входу
- * @param {number} stop - ціна стопа
- * @returns {Object} - розрахунки позиції
- */
 function calculatePosition(entry, stop) {
   const { margin, leverage } = config.risk;
-  const positionSize = margin * leverage; // $90 при $30×3
-  const stopDistance = Math.abs(entry - stop) / entry; // у відсотках (0.02 = 2%)
+  const positionSize = margin * leverage;
+  const stopDistance = Math.abs(entry - stop) / entry;
   const riskUsd = positionSize * stopDistance;
   const coinsAmount = positionSize / entry;
 
@@ -26,60 +21,55 @@ function calculatePosition(entry, stop) {
   };
 }
 
-/**
- * Розрахунок R:R
- */
 function calculateRR(entry, stop, target) {
   const risk = Math.abs(entry - stop);
   const reward = Math.abs(target - entry);
   return reward / risk;
 }
 
-// ============================================
-// СПИСОК ТРИГЕРІВ
-// Кожен тригер — це функція, яка перевіряє умову
-// і повертає сигнал, якщо умова виконана
-// ============================================
-
 /**
- * ТРИГЕР 1: Лонг на відскік від EMA 200 в бичачому тренді
+ * ТРИГЕР 1: Bullish Pin Bar біля Swing Low
  *
- * Умови:
- * - EMA 50 > EMA 200 (бичача структура)
- * - Ціна торкнулась EMA 200 знизу або трохи нижче
- * - RSI < 50 (перепроданість на тренді)
- *
- * Логіка: купуємо корекцію в висхідному тренді
+ * Логіка:
+ * - Знайти останній swing low (підтримка)
+ * - Поточна свічка — bullish pin bar
+ * - Pin bar торкнувся swing low (відмова від пробою)
+ * - Загальна структура: bullish або ranging (не контртренд)
  */
-function bullishPullbackToEma200(symbol, data) {
-  const { price, ema50, ema200, rsi, trend } = data;
+function bullishPinBarAtSupport(candles, currentIndex) {
+  if (currentIndex < 10) return null;
 
-  // Умова 1: загальний тренд бичачий
-  if (ema50 < ema200) return null;
+  const currentCandle = candles[currentIndex];
 
-  // Умова 2: ціна біля EMA 200 (в межах 1.5%)
-  const distanceToEma200 = Math.abs(price - ema200) / ema200;
-  if (distanceToEma200 > 0.015) return null;
+  // Перевіряємо що це pin bar
+  if (!pa.isBullishPinBar(currentCandle)) return null;
 
-  // Умова 3: RSI у зоні перепроданості тренду
-  if (rsi > 50) return null;
+  // Знаходимо swing low в недавньому минулому
+  const swingLowIdx = pa.findRecentSwingLow(candles, currentIndex - 1, 5, 30);
+  if (swingLowIdx === null) return null;
 
-  // Формуємо план угоди
-  const entry = price;
-  const stop = ema200 * 0.98; // -2% від EMA 200
-  const tp1 = entry * 1.025; // +2.5%
-  const tp2 = entry * 1.05; // +5%
+  const swingLowLevel = candles[swingLowIdx].low;
+
+  // Pin bar має торкнутись рівня swing low (з допуском)
+  if (!pa.touchedLevel(currentCandle, swingLowLevel, 0.5)) return null;
+
+  // HTF фільтр: загальна структура НЕ ведмежа
+  const structure = pa.getMarketStructure(candles.slice(0, currentIndex + 1));
+  if (structure === "bearish") return null;
+
+  // Формуємо план
+  const entry = currentCandle.close;
+  const stop = currentCandle.low * 0.998; // трохи нижче мінімуму pin bar
+  const stopDistance = entry - stop;
+  const tp1 = entry + stopDistance * 2; // 2R
+  const tp2 = entry + stopDistance * 3; // 3R
 
   const position = calculatePosition(entry, stop);
-
-  // Перевіряємо чи ризик не перевищує дозволений
-  if (position.riskUsd > config.risk.maxRiskUsd) {
-    return null;
-  }
+  if (position.riskUsd > config.risk.maxRiskUsd) return null;
 
   return {
     type: "LONG",
-    name: "Відскік від EMA 200",
+    name: "PinBarAtSupport",
     entry,
     stop,
     tp1,
@@ -87,38 +77,42 @@ function bullishPullbackToEma200(symbol, data) {
     rr1: calculateRR(entry, stop, tp1),
     rr2: calculateRR(entry, stop, tp2),
     position,
-    reason:
-      "Бичачий тренд (EMA50 > EMA200), ціна на EMA200, RSI у перепроданості",
+    reason: `Bullish pin bar біля swing low ${swingLowLevel.toFixed(2)}, структура: ${structure}`,
   };
 }
 
 /**
- * ТРИГЕР 2: Шорт від EMA 200 в ведмежому тренді
+ * ТРИГЕР 2: Bearish Pin Bar біля Swing High
  */
-function bearishRallyToEma200(symbol, data) {
-  const { price, ema50, ema200, rsi } = data;
+function bearishPinBarAtResistance(candles, currentIndex) {
+  if (currentIndex < 10) return null;
 
-  // Тренд ведмежий
-  if (ema50 > ema200) return null;
+  const currentCandle = candles[currentIndex];
 
-  // Ціна підійшла до EMA 200 знизу
-  const distanceToEma200 = Math.abs(price - ema200) / ema200;
-  if (distanceToEma200 > 0.015) return null;
+  if (!pa.isBearishPinBar(currentCandle)) return null;
 
-  // RSI вище 50 (відскік)
-  if (rsi < 50) return null;
+  const swingHighIdx = pa.findRecentSwingHigh(candles, currentIndex - 1, 5, 30);
+  if (swingHighIdx === null) return null;
 
-  const entry = price;
-  const stop = ema200 * 1.02; // +2% від EMA 200
-  const tp1 = entry * 0.975; // -2.5%
-  const tp2 = entry * 0.95; // -5%
+  const swingHighLevel = candles[swingHighIdx].high;
+
+  if (!pa.touchedLevel(currentCandle, swingHighLevel, 0.5)) return null;
+
+  const structure = pa.getMarketStructure(candles.slice(0, currentIndex + 1));
+  if (structure === "bullish") return null;
+
+  const entry = currentCandle.close;
+  const stop = currentCandle.high * 1.002;
+  const stopDistance = stop - entry;
+  const tp1 = entry - stopDistance * 2;
+  const tp2 = entry - stopDistance * 3;
 
   const position = calculatePosition(entry, stop);
   if (position.riskUsd > config.risk.maxRiskUsd) return null;
 
   return {
     type: "SHORT",
-    name: "Відскік до EMA 200",
+    name: "PinBarAtResistance",
     entry,
     stop,
     tp1,
@@ -126,36 +120,57 @@ function bearishRallyToEma200(symbol, data) {
     rr1: calculateRR(entry, stop, tp1),
     rr2: calculateRR(entry, stop, tp2),
     position,
-    reason: "Ведмежий тренд (EMA50 < EMA200), ціна на EMA200, RSI у відскоку",
+    reason: `Bearish pin bar біля swing high ${swingHighLevel.toFixed(2)}, структура: ${structure}`,
   };
 }
 
 /**
- * ТРИГЕР 3: Перепроданість RSI (контртрендовий лонг)
+ * ТРИГЕР 3 (V2): Bullish Engulfing на корекції в підтвердженому аптренді
  *
- * Умови:
- * - RSI < 30 (сильна перепроданість)
- * - Ціна нижче VWAP
- *
- * Логіка: ловимо локальне дно
+ * Покращена версія з трьома фільтрами:
+ * 1. Engulfing має бути СИЛЬНИМ (тіло >= 1.3× середнього)
+ * 2. Корекція має бути ЗНАЧУЩОЮ (>= 3% від попереднього high)
+ * 3. Структура підтверджена через swing-точки (HH + HL)
  */
-function oversoldBounce(symbol, data) {
-  const { price, rsi, vwap } = data;
+function bullishEngulfingPullback(candles, currentIndex) {
+  if (currentIndex < 30) return null;
 
-  if (rsi > 30) return null;
-  if (!vwap || price > vwap) return null;
+  const current = candles[currentIndex];
+  const prev = candles[currentIndex - 1];
 
-  const entry = price;
-  const stop = entry * 0.98; // -2%
-  const tp1 = entry * 1.025;
-  const tp2 = vwap; // ціль — повернення до VWAP
+  // ФІЛЬТР 1: Сильний engulfing
+  const recentCandles = candles.slice(currentIndex - 20, currentIndex);
+  const avgBody = pa.averageBodySize(recentCandles, 20);
+  if (!pa.isStrongBullishEngulfing(prev, current, avgBody, 1.3)) return null;
+
+  // Червоні свічки перед engulfing (корекція)
+  let redCount = 0;
+  for (let i = currentIndex - 1; i >= Math.max(0, currentIndex - 5); i--) {
+    if (candles[i].close < candles[i].open) redCount++;
+    else break;
+  }
+  if (redCount < 2) return null;
+
+  // ФІЛЬТР 2: Глибина корекції >= 3%
+  const pullbackDepth = pa.measurePullbackDepth(candles, currentIndex, 5);
+  if (pullbackDepth < 0.03) return null;
+
+  // ФІЛЬТР 3: Підтверджена бичача структура
+  if (!pa.isConfirmedBullishStructure(candles, currentIndex, 5)) return null;
+
+  // Формуємо план
+  const entry = current.close;
+  const stop = current.low * 0.998;
+  const stopDistance = entry - stop;
+  const tp1 = entry + stopDistance * 2;
+  const tp2 = entry + stopDistance * 3;
 
   const position = calculatePosition(entry, stop);
   if (position.riskUsd > config.risk.maxRiskUsd) return null;
 
   return {
     type: "LONG",
-    name: "Відскік від перепроданості",
+    name: "EngulfingPullback",
     entry,
     stop,
     tp1,
@@ -163,33 +178,80 @@ function oversoldBounce(symbol, data) {
     rr1: calculateRR(entry, stop, tp1),
     rr2: calculateRR(entry, stop, tp2),
     position,
-    reason: `RSI ${rsi.toFixed(1)} (перепроданість), ціна нижче VWAP`,
+    reason: `Сильний engulfing, корекція ${(pullbackDepth * 100).toFixed(1)}%, підтверджена HH/HL структура`,
   };
 }
 
 /**
- * Список всіх активних тригерів
+ * ТРИГЕР 4 (V2): Bearish Engulfing на відскоку в підтвердженому даунтренді
  */
+function bearishEngulfingRally(candles, currentIndex) {
+  if (currentIndex < 30) return null;
+
+  const current = candles[currentIndex];
+  const prev = candles[currentIndex - 1];
+
+  // ФІЛЬТР 1: Сильний engulfing
+  const recentCandles = candles.slice(currentIndex - 20, currentIndex);
+  const avgBody = pa.averageBodySize(recentCandles, 20);
+  if (!pa.isStrongBearishEngulfing(prev, current, avgBody, 1.3)) return null;
+
+  // Зелені свічки перед engulfing (відскок)
+  let greenCount = 0;
+  for (let i = currentIndex - 1; i >= Math.max(0, currentIndex - 5); i--) {
+    if (candles[i].close > candles[i].open) greenCount++;
+    else break;
+  }
+  if (greenCount < 2) return null;
+
+  // ФІЛЬТР 2: Глибина відскоку >= 3%
+  const rallyDepth = pa.measureRallyDepth(candles, currentIndex, 5);
+  if (rallyDepth < 0.03) return null;
+
+  // ФІЛЬТР 3: Підтверджена ведмежа структура
+  if (!pa.isConfirmedBearishStructure(candles, currentIndex, 5)) return null;
+
+  // План
+  const entry = current.close;
+  const stop = current.high * 1.002;
+  const stopDistance = stop - entry;
+  const tp1 = entry - stopDistance * 2;
+  const tp2 = entry - stopDistance * 3;
+
+  const position = calculatePosition(entry, stop);
+  if (position.riskUsd > config.risk.maxRiskUsd) return null;
+
+  return {
+    type: "SHORT",
+    name: "EngulfingRally",
+    entry,
+    stop,
+    tp1,
+    tp2,
+    rr1: calculateRR(entry, stop, tp1),
+    rr2: calculateRR(entry, stop, tp2),
+    position,
+    reason: `Сильний engulfing, відскок ${(rallyDepth * 100).toFixed(1)}%, підтверджена LH/LL структура`,
+  };
+}
+
 const ALL_TRIGGERS = [
-  bullishPullbackToEma200,
-  bearishRallyToEma200,
-  oversoldBounce,
+  // bearishPinBarAtResistance,  // вимкнено — WR 33%, P&L -$27 на 10 монетах
+  bullishEngulfingPullback,
+  bearishEngulfingRally,
 ];
 
 /**
- * Перевірити всі тригери для монети
- * Повертає масив активних сигналів
+ * Перевірити всі тригери на конкретній свічці
+ * @param {Array} candles - всі свічки до поточної
+ * @param {number} currentIndex - індекс перевіряємої свічки
  */
-function checkTriggers(symbol, data) {
+function checkTriggers(candles, currentIndex) {
   const signals = [];
-
   for (const triggerFn of ALL_TRIGGERS) {
-    const signal = triggerFn(symbol, data);
-    if (signal) {
-      signals.push(signal);
-    }
+    const signal = triggerFn(candles, currentIndex);
+    if (signal) signals.push(signal);
   }
-
   return signals;
 }
 

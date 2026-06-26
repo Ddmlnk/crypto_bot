@@ -3,15 +3,10 @@
 // Без ключів - публічні дані доступні всім
 // ============================================
 
-// Базовий URL Binance Spot API
 const BINANCE_API = "https://api.binance.com/api/v3";
 
 /**
  * Отримати свічки (klines) з Binance
- * @param {string} symbol - наприклад 'BTCUSDT'
- * @param {string} interval - таймфрейм '15m', '1h', '4h', '1d'
- * @param {number} limit - кількість свічок (макс 1000)
- * @returns {Promise<Array>} - масив свічок
  */
 async function getCandles(symbol, interval, limit = 250) {
   const url = `${BINANCE_API}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
@@ -27,11 +22,6 @@ async function getCandles(symbol, interval, limit = 250) {
 
     const data = await response.json();
 
-    // Binance повертає масив масивів. Перетворюємо в зручні обʼєкти:
-    // [
-    //   openTime, open, high, low, close, volume,
-    //   closeTime, quoteVolume, trades, ...
-    // ]
     const candles = data.map((c) => ({
       openTime: c[0],
       open: parseFloat(c[1]),
@@ -51,8 +41,6 @@ async function getCandles(symbol, interval, limit = 250) {
 
 /**
  * Отримати поточну ціну для пари
- * @param {string} symbol - наприклад 'BTCUSDT'
- * @returns {Promise<number|null>}
  */
 async function getCurrentPrice(symbol) {
   const url = `${BINANCE_API}/ticker/price?symbol=${symbol}`;
@@ -67,7 +55,64 @@ async function getCurrentPrice(symbol) {
   }
 }
 
+/**
+ * Отримати ВЕЛИКУ кількість свічок (більше 1000)
+ * Binance віддає максимум 1000 за запит, тому робимо пагінацію
+ */
+async function getCandlesHistory(symbol, interval, totalCandles) {
+  const BATCH_SIZE = 1000;
+  const batches = Math.ceil(totalCandles / BATCH_SIZE);
+
+  let allCandles = [];
+  let endTime = Date.now();
+
+  console.log(
+    `  📥 Завантажую ${totalCandles} свічок ${interval} для ${symbol}...`,
+  );
+
+  for (let i = 0; i < batches; i++) {
+    const limit = Math.min(BATCH_SIZE, totalCandles - allCandles.length);
+    const url = `${BINANCE_API}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}&endTime=${endTime}`;
+
+    try {
+      const response = await fetch(url);
+      const data = await response.json();
+
+      if (!data.length) break;
+
+      const batch = data.map((c) => ({
+        openTime: c[0],
+        open: parseFloat(c[1]),
+        high: parseFloat(c[2]),
+        low: parseFloat(c[3]),
+        close: parseFloat(c[4]),
+        volume: parseFloat(c[5]),
+        closeTime: c[6],
+      }));
+
+      allCandles = [...batch, ...allCandles];
+      endTime = batch[0].openTime - 1;
+
+      await new Promise((r) => setTimeout(r, 200));
+
+      process.stdout.write(
+        `\r  📥 ${allCandles.length}/${totalCandles} свічок завантажено`,
+      );
+    } catch (error) {
+      console.error(`\n  ❌ Помилка завантаження:`, error.message);
+      break;
+    }
+  }
+
+  console.log("");
+  return allCandles.slice(-totalCandles);
+}
+
+// ============================================
+// ЕКСПОРТ — тільки ОДИН раз в кінці файлу!
+// ============================================
 module.exports = {
   getCandles,
   getCurrentPrice,
+  getCandlesHistory,
 };
