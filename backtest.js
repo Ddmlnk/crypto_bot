@@ -1,5 +1,5 @@
 // ============================================
-// BACKTEST — Price Action стратегія
+// BACKTEST — 4H, всі кандидати, TRAIN/TEST SPLIT
 // ============================================
 
 const fs = require("fs");
@@ -8,30 +8,34 @@ const path = require("path");
 const config = require("./config");
 const { getCandlesHistory } = require("./binance");
 const { checkTriggers } = require("./triggers");
+const { checkTriggersV2 } = require("./triggers_v2");
+const { checkRangeTriggers } = require("./range_triggers");
+const { checkSmcTriggers } = require("./smc_triggers");
+const { computeRegimeSeries } = require("./regime");
 
 const BACKTEST_CONFIG = {
-  candlesCount: 4320, // 180 днів на 1H
+  candlesCount: 12000, // ~5.5 років 4H — пагінація візьме скільки є
   positionSize: 90,
   maxRiskUsd: 3,
   feePercent: 0.04,
   slippagePercent: 0.05,
 };
-// Групи монет для категоризованого аналізу
-const SYMBOL_GROUPS = {
-  "Топ-капа": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"],
-  "L1/L2 альти": ["AVAXUSDT", "LINKUSDT", "ADAUSDT"],
-  "Мемкоїни/XRP": ["DOGEUSDT", "XRPUSDT", "TRXUSDT"],
-};
 
-function getSymbolGroup(symbol) {
-  for (const [group, symbols] of Object.entries(SYMBOL_GROUPS)) {
-    if (symbols.includes(symbol)) return group;
-  }
-  return "Інші";
+const SPLIT_MS = new Date(config.splitDate).getTime();
+
+function passesRouting(signalName, regime) {
+  const rule = config.triggerRouting[signalName];
+  if (!rule) return false;
+  if (!regime) return false;
+  const macro = regime.macro || "UNKNOWN";
+  return Array.isArray(rule.macro) && rule.macro.includes(macro);
 }
-/**
- * Симуляція угоди — йдемо вперед поки не стоп або TP
- */
+
+function monthKey(ms) {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
 function simulateTrade(signal, candles, startIndex) {
   const { type, entry, stop, tp1, tp2 } = signal;
   const { feePercent, slippagePercent, positionSize } = BACKTEST_CONFIG;
@@ -39,13 +43,12 @@ function simulateTrade(signal, candles, startIndex) {
   const slip = slippagePercent / 100;
   const realEntry = type === "LONG" ? entry * (1 + slip) : entry * (1 - slip);
 
-  let exitPrice = null;
-  let exitReason = null;
-  let exitBarIndex = null;
+  let exitPrice = null,
+    exitReason = null,
+    exitBarIndex = null;
 
   for (let i = startIndex + 1; i < candles.length; i++) {
     const bar = candles[i];
-
     if (type === "LONG") {
       if (bar.low <= stop) {
         exitPrice = stop * (1 - slip);
@@ -93,7 +96,6 @@ function simulateTrade(signal, candles, startIndex) {
     type === "LONG"
       ? (exitPrice - realEntry) / realEntry
       : (realEntry - exitPrice) / realEntry;
-
   const totalFees = (feePercent / 100) * 2;
   const netPriceChange = priceChange - totalFees;
 
@@ -115,7 +117,7 @@ function simulateTrade(signal, candles, startIndex) {
   };
 }
 
-async function backtest(symbol) {
+async function backtest(symbol, regimeDist) {
   console.log(`\n🧪 BACKTEST: ${symbol}`);
   console.log("━".repeat(50));
 
@@ -124,237 +126,199 @@ async function backtest(symbol) {
     config.timeframe,
     BACKTEST_CONFIG.candlesCount,
   );
-  if (candles.length < 100) {
-    console.log(`  ❌ Недостатньо даних`);
-    return [];
+  if (!candles || candles.length < 250) {
+    console.log(`  ❌ Недостатньо даних (${candles ? candles.length : 0})`);
+    return { trades: [] };
   }
-  console.log(`  ✅ Завантажено ${candles.length} свічок`);
+
+  const first = new Date(candles[0].openTime).toISOString().slice(0, 10);
+  const last = new Date(candles[candles.length - 1].openTime)
+    .toISOString()
+    .slice(0, 10);
+  console.log(`  ✅ ${candles.length} свічок | ${first} → ${last}`);
+
+  const regimeSeries = computeRegimeSeries(candles, config.regime);
+
+  // збір розподілу режимів (діагностика денних ADX-порогів)
+  for (const r of regimeSeries) {
+    if (!r) continue;
+    regimeDist[r.macro] = (regimeDist[r.macro] || 0) + 1;
+  }
 
   const trades = [];
   let openTradeUntilBar = -1;
 
-  // Починаємо з 50-ї свічки щоб мати історію для аналізу
   for (let i = 50; i < candles.length - 1; i++) {
     if (i < openTradeUntilBar) continue;
+    const regime = regimeSeries[i];
 
-    const signals = checkTriggers(candles, i);
+    const rawSignals = [
+      ...checkTriggers(candles, i),
+      ...checkTriggersV2(candles, i, symbol),
+      ...checkRangeTriggers(candles, i, symbol),
+      ...checkSmcTriggers(candles, i),
+    ];
+    if (rawSignals.length === 0) continue;
+
+    const signals = rawSignals.filter((s) => passesRouting(s.name, regime));
     if (signals.length === 0) continue;
 
-    // Беремо перший сигнал якщо їх кілька (можна було б обирати кращий R:R)
     const signal = signals[0];
     const trade = simulateTrade(signal, candles, i);
     if (!trade) continue;
 
-    trades.push({ ...trade, symbol });
+    trades.push({
+      ...trade,
+      symbol,
+      macro: regime ? regime.macro : "UNKNOWN",
+      phase: trade.entryTime < SPLIT_MS ? "TRAIN" : "TEST",
+      month: monthKey(trade.entryTime),
+    });
     openTradeUntilBar = trade.exitBarIndex;
   }
 
-  console.log(`  📊 Знайдено угод: ${trades.length}`);
-  return trades;
+  console.log(`  📊 Угод: ${trades.length}`);
+  return { trades };
 }
 
-function calculateStats(trades) {
-  if (trades.length === 0) return { count: 0 };
-
-  const wins = trades.filter((t) => t.pnlUsd > 0);
-  const losses = trades.filter((t) => t.pnlUsd <= 0);
-
-  const totalPnl = trades.reduce((s, t) => s + t.pnlUsd, 0);
-  const grossWin = wins.reduce((s, t) => s + t.pnlUsd, 0);
-  const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnlUsd, 0));
-
-  const avgWin = wins.length ? grossWin / wins.length : 0;
-  const avgLoss = losses.length ? grossLoss / losses.length : 0;
-
-  let peak = 0,
-    equity = 0,
-    maxDD = 0;
+function agg(trades) {
+  if (!trades.length) return { n: 0, wr: 0, pnl: 0, pf: 0 };
+  let wins = 0,
+    gw = 0,
+    gl = 0,
+    pnl = 0;
   for (const t of trades) {
-    equity += t.pnlUsd;
-    if (equity > peak) peak = equity;
-    if (peak - equity > maxDD) maxDD = peak - equity;
+    pnl += t.pnlUsd;
+    if (t.pnlUsd > 0) {
+      wins++;
+      gw += t.pnlUsd;
+    } else gl += Math.abs(t.pnlUsd);
   }
-
-  const bySignal = {};
-  for (const t of trades) {
-    if (!bySignal[t.signal]) bySignal[t.signal] = { count: 0, wins: 0, pnl: 0 };
-    bySignal[t.signal].count++;
-    if (t.pnlUsd > 0) bySignal[t.signal].wins++;
-    bySignal[t.signal].pnl += t.pnlUsd;
-  }
-
-  // Розподіл по причинах виходу
-  const byExitReason = {};
-  for (const t of trades) {
-    byExitReason[t.exitReason] = (byExitReason[t.exitReason] || 0) + 1;
-  }
-
   return {
-    count: trades.length,
-    wins: wins.length,
-    losses: losses.length,
-    winRate: (wins.length / trades.length) * 100,
-    totalPnl,
-    profitFactor: grossLoss > 0 ? grossWin / grossLoss : Infinity,
-    avgWin,
-    avgLoss,
-    avgRR: avgLoss > 0 ? avgWin / avgLoss : Infinity,
-    maxDD,
-    bySignal,
-    byExitReason,
+    n: trades.length,
+    wr: +((wins / trades.length) * 100).toFixed(1),
+    pnl: +pnl.toFixed(2),
+    pf: gl === 0 ? Infinity : +(gw / gl).toFixed(2),
   };
 }
 
-function printReport(symbol, trades, stats) {
-  console.log(`\n📈 РЕЗУЛЬТАТИ ${symbol}`);
-  console.log("━".repeat(50));
+function fmt(a) {
+  return `${a.n} угод | WR ${a.wr}% | P&L $${a.pnl} | PF ${a.pf}`;
+}
 
-  if (stats.count === 0) {
-    console.log("  Немає угод");
-    return;
+function printSplitReport(allTrades) {
+  const train = allTrades.filter((t) => t.phase === "TRAIN");
+  const test = allTrades.filter((t) => t.phase === "TEST");
+
+  console.log("\n");
+  console.log("═".repeat(55));
+  console.log("🔬 TRAIN / TEST SPLIT");
+  console.log(`   межа: ${config.splitDate}`);
+  console.log("═".repeat(55));
+
+  console.log(`\n  📊 ЗАГАЛОМ:`);
+  console.log(`    TRAIN: ${fmt(agg(train))}`);
+  console.log(`    TEST:  ${fmt(agg(test))}`);
+
+  console.log(`\n  🎯 ПО КОЖНОМУ ТРИГЕРУ (TRAIN / TEST):`);
+  const names = [...new Set(allTrades.map((t) => t.signal))].sort();
+  for (const name of names) {
+    const tr = train.filter((t) => t.signal === name);
+    const te = test.filter((t) => t.signal === name);
+    console.log(`\n    ${name}:`);
+    console.log(`      TRAIN: ${fmt(agg(tr))}`);
+    console.log(`      TEST:  ${fmt(agg(te))}`);
   }
+}
 
-  const pnlIcon = stats.totalPnl >= 0 ? "🟢" : "🔴";
-  console.log(`  ${pnlIcon} Total P&L: $${stats.totalPnl.toFixed(2)}`);
-  console.log(
-    `  📊 Угод: ${stats.count} (${stats.wins} W / ${stats.losses} L)`,
-  );
-  console.log(`  ✅ Win Rate: ${stats.winRate.toFixed(1)}%`);
-  console.log(`  📈 Profit Factor: ${stats.profitFactor.toFixed(2)}`);
-  console.log(`  💰 Avg Win: $${stats.avgWin.toFixed(2)}`);
-  console.log(`  💸 Avg Loss: -$${stats.avgLoss.toFixed(2)}`);
-  console.log(`  ⚖️  Avg R:R: ${stats.avgRR.toFixed(2)}`);
-  console.log(`  📉 Max Drawdown: -$${stats.maxDD.toFixed(2)}`);
-
-  console.log(`\n  🎯 По тригерах:`);
-  for (const [name, data] of Object.entries(stats.bySignal)) {
-    const wr = (data.wins / data.count) * 100;
-    const icon = data.pnl >= 0 ? "🟢" : "🔴";
-    console.log(
-      `    ${icon} ${name}: ${data.count} угод, WR ${wr.toFixed(0)}%, P&L $${data.pnl.toFixed(2)}`,
-    );
-  }
-
-  if (stats.byExitReason) {
-    console.log(`\n  🚪 Виходи:`);
-    for (const [reason, count] of Object.entries(stats.byExitReason)) {
-      const pct = ((count / stats.count) * 100).toFixed(0);
-      console.log(`    ${reason}: ${count} (${pct}%)`);
+function printMacroBreakdown(allTrades) {
+  console.log("\n");
+  console.log("═".repeat(55));
+  console.log("🧭 ПО МАКРОРЕЖИМАХ (кожен тригер × режим, TEST only)");
+  console.log("═".repeat(55));
+  const test = allTrades.filter((t) => t.phase === "TEST");
+  const names = [...new Set(test.map((t) => t.signal))].sort();
+  for (const name of names) {
+    console.log(`\n  ${name}:`);
+    for (const m of ["UP", "DOWN", "FLAT"]) {
+      const sub = test.filter((t) => t.signal === name && t.macro === m);
+      if (!sub.length) continue;
+      const a = agg(sub);
+      const icon = a.pnl > 0 ? "🟢" : "🔴";
+      console.log(`    ${icon} ${m.padEnd(5)}: ${fmt(a)}`);
     }
   }
 }
 
-function saveTradesCSV(trades, filename) {
-  if (trades.length === 0) return;
+async function runFullBacktest() {
+  console.log("🧪 4H BACKTEST — ВСІ КАНДИДАТИ + TRAIN/TEST");
+  console.log("═".repeat(50));
+  console.log(
+    `ТФ: ${config.timeframe} | Режим: ${config.regime.htf} EMA${config.regime.fastPeriod}/${config.regime.slowPeriod} ADX${config.regime.adxPeriod}`,
+  );
+  console.log(
+    `Запит свічок: ${BACKTEST_CONFIG.candlesCount} | Монет: ${config.symbols.length}`,
+  );
+  console.log(`Split: ${config.splitDate}`);
+  console.log("═".repeat(50));
 
+  const allTrades = [];
+  const regimeDist = {};
+
+  for (const symbol of config.symbols) {
+    const { trades } = await backtest(symbol, regimeDist);
+    allTrades.push(...trades);
+  }
+
+  // діагностика режимів (чи адекватні денні ADX-пороги)
+  console.log("\n");
+  console.log("═".repeat(55));
+  console.log("🧭 РОЗПОДІЛ РЕЖИМІВ (денний ТФ) — перевірка порогів");
+  console.log("═".repeat(55));
+  const totalR = Object.values(regimeDist).reduce((s, c) => s + c, 0);
+  for (const [m, c] of Object.entries(regimeDist)) {
+    console.log(`  ${m.padEnd(8)}: ${c} (${((c / totalR) * 100).toFixed(0)}%)`);
+  }
+
+  if (allTrades.length === 0) {
+    console.log("\n⚠️  Жодної угоди.");
+    return;
+  }
+
+  printSplitReport(allTrades);
+  printMacroBreakdown(allTrades);
+
+  const timestamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const csvPath = path.join("backtest-results", `h4_trades_${timestamp}.csv`);
   const headers = [
     "Symbol",
     "Signal",
     "Type",
     "EntryTime",
-    "ExitTime",
-    "Entry",
-    "Exit",
-    "Stop",
-    "TP1",
-    "TP2",
-    "ExitReason",
+    "Macro",
+    "Phase",
+    "Month",
     "PnL_USD",
-    "PnL_Percent",
+    "ExitReason",
     "BarsHeld",
   ];
-
-  const rows = trades.map((t) => [
+  const rows = allTrades.map((t) => [
     t.symbol,
     t.signal,
     t.type,
     new Date(t.entryTime).toISOString(),
-    new Date(t.exitTime).toISOString(),
-    t.entry.toFixed(2),
-    t.exit.toFixed(2),
-    t.stop.toFixed(2),
-    t.tp1.toFixed(2),
-    t.tp2.toFixed(2),
-    t.exitReason,
+    t.macro,
+    t.phase,
+    t.month,
     t.pnlUsd.toFixed(2),
-    t.pnlPercent.toFixed(2),
+    t.exitReason,
     t.barsHeld,
   ]);
-
-  const csv = [headers, ...rows].map((r) => r.join(",")).join("\n");
-  fs.writeFileSync(filename, csv);
-  console.log(`\n💾 Збережено: ${filename}`);
-}
-
-async function runFullBacktest() {
-  console.log("🧪 PRICE ACTION BACKTEST");
-  console.log("═".repeat(50));
-  console.log(`Таймфрейм: ${config.timeframe}`);
-  console.log(`Період: ${BACKTEST_CONFIG.candlesCount} свічок`);
-  console.log(`Монети: ${config.symbols.join(", ")}`);
-  console.log(`Розмір позиції: $${BACKTEST_CONFIG.positionSize}`);
-  console.log(`Макс ризик: $${BACKTEST_CONFIG.maxRiskUsd}`);
-  console.log("═".repeat(50));
-
-  const allTrades = [];
-
-  for (const symbol of config.symbols) {
-    const trades = await backtest(symbol);
-    if (trades.length > 0) {
-      const stats = calculateStats(trades);
-      printReport(symbol, trades, stats);
-      allTrades.push(...trades);
-    }
-  }
-
-  console.log("\n");
-  console.log("═".repeat(50));
-  console.log("🎯 ЗАГАЛЬНІ РЕЗУЛЬТАТИ");
-  console.log("═".repeat(50));
-
-  // ============================================
-  // СТАТИСТИКА ПО ГРУПАХ
-  // ============================================
-  console.log("\n");
-  console.log("═".repeat(50));
-  console.log("📊 ПО ГРУПАХ МОНЕТ");
-  console.log("═".repeat(50));
-
-  for (const [groupName, groupSymbols] of Object.entries(SYMBOL_GROUPS)) {
-    const groupTrades = allTrades.filter((t) =>
-      groupSymbols.includes(t.symbol),
-    );
-    if (groupTrades.length === 0) continue;
-
-    console.log(`\n🔹 ${groupName}`);
-    console.log("━".repeat(50));
-
-    const stats = calculateStats(groupTrades);
-    const pnlIcon = stats.totalPnl >= 0 ? "🟢" : "🔴";
-    console.log(
-      `  ${pnlIcon} P&L: $${stats.totalPnl.toFixed(2)} | Угод: ${stats.count} | WR: ${stats.winRate.toFixed(1)}% | PF: ${stats.profitFactor.toFixed(2)}`,
-    );
-
-    // По кожній монеті всередині групи
-    const bySymbol = {};
-    for (const t of groupTrades) {
-      if (!bySymbol[t.symbol]) bySymbol[t.symbol] = { trades: [] };
-      bySymbol[t.symbol].trades.push(t);
-    }
-    for (const [sym, data] of Object.entries(bySymbol)) {
-      const sStats = calculateStats(data.trades);
-      const icon = sStats.totalPnl >= 0 ? "🟢" : "🔴";
-      console.log(
-        `    ${icon} ${sym}: $${sStats.totalPnl.toFixed(2)} (${sStats.count} угод, WR ${sStats.winRate.toFixed(0)}%)`,
-      );
-    }
-  }
-  const totalStats = calculateStats(allTrades);
-  printReport("ALL", allTrades, totalStats);
-
-  const timestamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-  const csvPath = path.join("backtest-results", `pa_trades_${timestamp}.csv`);
-  saveTradesCSV(allTrades, csvPath);
+  fs.writeFileSync(
+    csvPath,
+    [headers, ...rows].map((r) => r.join(",")).join("\n"),
+  );
+  console.log(`\n💾 Збережено: ${csvPath}`);
 
   console.log("\n✅ Бектест завершено!\n");
 }
